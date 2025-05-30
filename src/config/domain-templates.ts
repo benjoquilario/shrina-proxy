@@ -337,6 +337,25 @@ export const domainTemplates: DomainTemplate[] = [
         };
       }
     },
+
+    {
+      pattern: /lightningspark77\.pro$/i,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.5',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      },
+      headersFn: (url: URL) => {
+        return {
+          'origin': 'https://megacloud.blog',
+          'referer': 'https://megacloud.blog/',
+        };
+      }
+    },
+  
   
     // clearskydrift45.site
     {
@@ -375,6 +394,26 @@ export const domainTemplates: DomainTemplate[] = [
         };
       }
     },
+
+    // thunderwave48.xyz
+    {
+      pattern: /thunderwave48\.xyz$/i,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.5',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      },
+      headersFn: (url: URL) => {
+        return {
+          'origin': 'https://megacloud.blog',
+          'referer': 'https://megacloud.blog/',
+        };
+      }
+    },
+
 
     // stormwatch95.site
     {
