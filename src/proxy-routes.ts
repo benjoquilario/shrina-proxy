@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction, Router } from 'express';
 import fetch from 'node-fetch';
 import { URL } from 'url';
+import https from 'https';
 import { PROXY, ROUTES, SERVER } from './config/constants.js';
 import { logger } from './middleware.js';
 import { generateHeadersForUrl } from './config/domain-templates.js';
@@ -9,7 +10,11 @@ import { processM3u8Content } from './utils/m3u8-handler.js';
 import { 
   validateUrl, 
   determineContentType, 
-  processVttContent 
+  processVttContent,
+  decodeImageUrl,
+  encodeImageUrl,
+  isImageUrl,
+  isObfuscatedVideoSegment
 } from './utils/helpers.js';
 import { decompressWithWorker, getWorkerStats } from './utils/worker-pool.js';
 import {
@@ -31,6 +36,17 @@ import {
 } from './utils/performance-monitor.js';
 
 const router: Router = express.Router();
+
+// Create an HTTPS agent that doesn't validate certificates for redirects
+// This is necessary because some CDNs redirect to different domains
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false, // Disable certificate validation
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: PROXY.REQUEST_TIMEOUT,
+});
 
 // Extend Express Request type to include targetUrl
 declare global {
@@ -139,6 +155,7 @@ async function streamProxyRequest(req: Request, res: Response, url: string, head
       method: req.method,
       headers,
       signal: abortController.signal,
+      agent: url.startsWith('https') ? httpsAgent : undefined,
     });
     
     clearTimeout(timeoutId);
@@ -187,18 +204,34 @@ async function streamProxyRequest(req: Request, res: Response, url: string, head
     const isCompressed = !!contentEncoding && 
                          ['gzip', 'br', 'deflate', 'zstd'].includes(contentEncoding.toLowerCase());
     
-    // Set response headers
+    // Selectively forward important response headers (following Rust proxy pattern)
+    const importantHeaders = [
+      'content-type',
+      'content-length',
+      'content-range',
+      'accept-ranges',
+      'cache-control',
+      'expires',
+      'last-modified',
+      'etag',
+      'content-encoding',
+      'vary',
+    ];
+    
     for (const [key, value] of Object.entries(response.headers.raw())) {
-      if (!['connection', 'transfer-encoding'].includes(key.toLowerCase())) {
+      const keyLower = key.toLowerCase();
+      if (importantHeaders.includes(keyLower)) {
         res.setHeader(key, value);
       }
     }
     
-    // Add CORS headers
+    // Add comprehensive CORS headers (following Rust proxy pattern)
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Range');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD, PUT, DELETE, PATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range, X-Requested-With, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection, If-Range, If-None-Match, If-Modified-Since');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified, Content-Encoding');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Vary', 'Origin');
     
     // Set status code
     res.status(response.status);
@@ -210,8 +243,12 @@ async function streamProxyRequest(req: Request, res: Response, url: string, head
     
     // Handle different content types and compression scenarios
     
+    // Check if this is an obfuscated video segment
+    const isObfuscated = isObfuscatedVideoSegment(url, contentType);
+    
     // Case 1: Compressed content that needs special processing (m3u8, vtt, srt)
-    if (isCompressed && ['m3u8', 'vtt', 'srt'].some(ext => url.toLowerCase().endsWith(`.${ext}`))) {
+    // Skip decompression for obfuscated segments
+    if (isCompressed && !isObfuscated && ['m3u8', 'vtt', 'srt'].some(ext => url.toLowerCase().endsWith(`.${ext}`))) {
       // For text-based formats that need processing but are compressed,
       // we need to decompress fully first
       const arrayBuffer = await response.arrayBuffer();
@@ -290,7 +327,7 @@ async function streamProxyRequest(req: Request, res: Response, url: string, head
       }
     } 
     // Case 3: Compressed content that doesn't need special processing
-    else if (isCompressed) {
+    else if (isCompressed && !isObfuscated) {
       // For compressed content that doesn't need special processing,
       // we can't stream it directly as the client expects uncompressed
       const arrayBuffer = await response.arrayBuffer();
@@ -299,6 +336,26 @@ async function streamProxyRequest(req: Request, res: Response, url: string, head
       res.removeHeader('content-encoding');
       recordResponse(requestStartTime, true, arrayBuffer.byteLength, buffer.length);
       return res.send(buffer);
+    }
+    // Case 3b: Obfuscated segments with fake compression headers
+    else if (isObfuscated && isCompressed) {
+      // These files claim compression but aren't actually compressed
+      // Stream them directly without decompression
+      logger.debug({
+        type: 'stream-proxy',
+        url,
+        contentType,
+        note: 'Obfuscated segment - skipping decompression'
+      }, 'Detected obfuscated video segment');
+      
+      // Keep the content-encoding header as-is (browser will handle it)
+      // Just stream the content directly
+      if (response.body) {
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        recordResponse(requestStartTime, true, 0, buffer.length);
+        return res.send(buffer);
+      }
     } 
     // Case 4: Uncompressed content that doesn't need special processing - direct streaming
     else if (response.body) {
@@ -599,7 +656,7 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
     // Set host header to match target URL
     headers['host'] = targetUrl.host;
     
-    // Explicitly handle Range header for audio segments
+    // Forward important client request headers for caching and range requests
     if (req.headers.range) {
       headers['range'] = req.headers.range as string;
       logger.debug({
@@ -607,6 +664,17 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
         url,
         range: req.headers.range
       }, 'Forwarding Range header');
+    }
+    
+    // Forward conditional request headers (for HTTP caching)
+    if (req.headers['if-range']) {
+      headers['if-range'] = req.headers['if-range'] as string;
+    }
+    if (req.headers['if-none-match']) {
+      headers['if-none-match'] = req.headers['if-none-match'] as string;
+    }
+    if (req.headers['if-modified-since']) {
+      headers['if-modified-since'] = req.headers['if-modified-since'] as string;
     }
     
     // Get request body for non-GET requests
@@ -643,6 +711,7 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
         body,
         redirect: 'follow',
         signal: abortController.signal,
+        agent: url.startsWith('https') ? httpsAgent : undefined,
       });
       
       clearTimeout(timeoutId);
@@ -696,13 +765,27 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
                           contentType?.includes('application/x-mpegurl') ||
                           url.toLowerCase().endsWith('.m3u8');
       
-      // Forward response headers
+      // Selectively forward important response headers (following Rust proxy pattern)
+      const importantHeaders = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'cache-control',
+        'expires',
+        'last-modified',
+        'etag',
+        'vary',
+      ];
+      
+      // Add content-encoding for audio segments
+      if (isAudioSegment) {
+        importantHeaders.push('content-encoding');
+      }
+      
       for (const [key, value] of Object.entries(response.headers.raw())) {
-        if (!['connection', 'transfer-encoding'].includes(key.toLowerCase())) {
-          // Keep content-encoding header for audio segments
-          if (key.toLowerCase() === 'content-encoding' && !isAudioSegment) {
-            continue;
-          }
+        const keyLower = key.toLowerCase();
+        if (importantHeaders.includes(keyLower)) {
           res.setHeader(key, value);
         }
       }
@@ -712,11 +795,13 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
         res.setHeader('Accept-Ranges', 'bytes');
       }
       
-      // Add CORS headers
+      // Add comprehensive CORS headers (following Rust proxy pattern)
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Range');
-      res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD, PUT, DELETE, PATCH');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range, X-Requested-With, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection, If-Range, If-None-Match, If-Modified-Since');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified, Content-Encoding');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      res.setHeader('Vary', 'Origin');
       
       // Handle error status codes (4xx, 5xx) properly
       if (response.status >= 400) {
@@ -1014,8 +1099,11 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
           // Get the content as an ArrayBuffer
           const responseBuffer = await response.arrayBuffer();
           
-          // Decompress content if needed
-          const buffer = contentEncoding && !isAudioSegment
+          // Check if this is an obfuscated video segment (fake extension)
+          const isObfuscated = isObfuscatedVideoSegment(url, contentType);
+          
+          // Decompress content if needed (but skip for obfuscated segments)
+          const buffer = contentEncoding && !isAudioSegment && !isObfuscated
             ? await decompressWithWorker(
                 Buffer.from(responseBuffer),
                 contentEncoding
@@ -1049,7 +1137,8 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
           }
           
           // Don't forward content-encoding header if we've decompressed the content
-          if (contentEncoding && !isAudioSegment) {
+          // For obfuscated segments, keep the original encoding header (they're not actually compressed)
+          if (contentEncoding && !isAudioSegment && !isObfuscated) {
             res.removeHeader('content-encoding');
           }
           
@@ -1142,6 +1231,303 @@ async function proxyRequest(req: Request, res: Response, next: NextFunction) {
     });
   }
 }
+
+// ==================== IMAGE PROXY ROUTES ====================
+
+/**
+ * Image proxy endpoint - handles encoded image URLs
+ * Usage: <img src="/image/base64encodedurl" />
+ */
+router.get('/image/:encodedUrl', async (req: Request, res: Response) => {
+  const { encodedUrl } = req.params;
+  
+  if (!encodedUrl) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: 'Missing encoded URL parameter',
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  
+  let imageUrl: string;
+  
+  try {
+    // Decode the URL
+    imageUrl = decodeImageUrl(encodedUrl);
+  } catch (error) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: 'Invalid encoded URL',
+        details: error instanceof Error ? error.message : String(error),
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  
+  // Validate the decoded URL
+  const validation = validateUrl(imageUrl, {
+    maxUrlLength: PROXY.MAX_REQUEST_SIZE,
+    allowedDomains: PROXY.ENABLE_DOMAIN_WHITELIST ? PROXY.ALLOWED_DOMAINS : [],
+  });
+  
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: validation.reason || 'Invalid image URL',
+        url: imageUrl,
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  
+  const requestStartTime = recordRequest();
+  
+  try {
+    // Check cache first
+    const cacheKey = generateCacheKey(imageUrl, { accept: 'image/*' });
+    const cachedItem = getCacheItem(cacheKey);
+    
+    if (cachedItem) {
+      recordCacheHit();
+      
+      // Determine content type from cached data
+      const contentType = determineContentType(cachedItem.data, null, imageUrl);
+      
+      // Set response headers
+      res.setHeader('Content-Type', contentType || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('X-Cache', 'HIT');
+      
+      // Add CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+      
+      recordResponse(requestStartTime, true, 0, cachedItem.data.length);
+      return res.send(cachedItem.data);
+    }
+    
+    recordCacheMiss();
+    
+    // Set up request headers
+    const headers: Record<string, string> = {
+      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br, zstd',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    };
+    
+    // Parse target URL and set host header
+    const targetUrl = new URL(imageUrl);
+    headers['host'] = targetUrl.host;
+    
+    // Apply domain-specific headers
+    const domainHeaders = generateHeadersForUrl(targetUrl);
+    Object.assign(headers, domainHeaders);
+    
+    // Fetch the image
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), PROXY.REQUEST_TIMEOUT);
+    
+    try {
+      const response = await fetch(imageUrl, {
+        method: 'GET',
+        headers,
+        signal: abortController.signal,
+        agent: imageUrl.startsWith('https') ? httpsAgent : undefined,
+      });
+      
+      clearTimeout(timeoutId);
+      
+      // Handle error responses
+      if (response.status >= 400) {
+        logger.warn({
+          type: 'image-proxy',
+          url: imageUrl,
+          status: response.status,
+          statusText: response.statusText,
+        }, `Image proxy received error status: ${response.status}`);
+        
+        recordResponse(requestStartTime, false, 0, 0);
+        
+        return res.status(response.status).json({
+          error: {
+            code: response.status,
+            message: `Failed to fetch image: ${response.statusText}`,
+            url: imageUrl,
+          },
+          success: false,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      
+      // Get content type and encoding
+      const contentType = response.headers.get('content-type');
+      const contentEncoding = response.headers.get('content-encoding');
+      
+      // Verify it's an image
+      if (!isImageUrl(imageUrl, contentType)) {
+        logger.warn({
+          type: 'image-proxy',
+          url: imageUrl,
+          contentType,
+        }, 'URL does not appear to be an image');
+      }
+      
+      // Get the image data
+      const arrayBuffer = await response.arrayBuffer();
+      let buffer = Buffer.from(arrayBuffer);
+      
+      // Decompress if needed
+      if (contentEncoding) {
+        const decompressedBuffer = await decompressWithWorker(buffer, contentEncoding);
+        buffer = Buffer.from(decompressedBuffer);
+      }
+      
+      // Determine actual content type from binary data
+      const detectedType = determineContentType(buffer, contentType, imageUrl);
+      
+      // Set response headers
+      res.setHeader('Content-Type', detectedType || contentType || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('X-Cache', 'MISS');
+      
+      // Add comprehensive CORS headers (following Rust proxy pattern)
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Type, Cache-Control, ETag, Last-Modified');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      res.setHeader('Vary', 'Origin');
+      
+      // Cache the image (up to 10MB)
+      if (buffer.length <= 10 * 1024 * 1024) {
+        setCacheItem(cacheKey, buffer, buffer.length);
+      }
+      
+      logger.debug({
+        type: 'image-proxy',
+        url: imageUrl,
+        contentType: detectedType || contentType,
+        size: buffer.length,
+      }, `Successfully proxied image`);
+      
+      recordResponse(requestStartTime, true, 0, buffer.length);
+      return res.send(buffer);
+      
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (error) {
+    logger.error({
+      type: 'image-proxy',
+      url: imageUrl,
+      error: error instanceof Error ? error.message : String(error),
+    }, 'Image proxy request failed');
+    
+    let statusCode = 500;
+    let errorMessage = 'Failed to proxy image';
+    
+    if (error instanceof Error) {
+      if (error.name === 'AbortError') {
+        statusCode = 504;
+        errorMessage = `Request timed out after ${PROXY.REQUEST_TIMEOUT}ms`;
+      } else {
+        errorMessage = error.message || errorMessage;
+      }
+    }
+    
+    recordResponse(requestStartTime, false, 0, 0);
+    
+    return res.status(statusCode).json({
+      error: {
+        code: statusCode,
+        message: errorMessage,
+        url: imageUrl,
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+/**
+ * Image encode endpoint - helper to generate encoded URLs
+ * Usage: GET /image/encode?url=https://example.com/image.jpg
+ */
+router.get('/image/encode', (req: Request, res: Response) => {
+  const imageUrl = req.query.url as string;
+  
+  if (!imageUrl) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: 'Missing URL parameter',
+        usage: 'Use ?url=https://example.com/image.jpg',
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  
+  // Validate URL
+  const validation = validateUrl(imageUrl, {
+    maxUrlLength: PROXY.MAX_REQUEST_SIZE,
+    allowedDomains: PROXY.ENABLE_DOMAIN_WHITELIST ? PROXY.ALLOWED_DOMAINS : [],
+  });
+  
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: validation.reason || 'Invalid URL',
+        url: imageUrl,
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  
+  try {
+    const encodedUrl = encodeImageUrl(imageUrl);
+    const proxiedUrl = `${ROUTES.IMAGE_PROXY_BASE}/${encodedUrl}`;
+    
+    // Get the base URL from request
+    const protocol = req.protocol;
+    const host = req.get('host');
+    const fullProxiedUrl = `${protocol}://${host}${proxiedUrl}`;
+    
+    return res.json({
+      success: true,
+      data: {
+        originalUrl: imageUrl,
+        encodedUrl,
+        proxiedUrl,
+        fullProxiedUrl,
+        htmlExample: `<img src="${proxiedUrl}" alt="Proxied image" />`,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: {
+        code: 500,
+        message: 'Failed to encode URL',
+        details: error instanceof Error ? error.message : String(error),
+      },
+      success: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// ==================== STATUS & MONITORING ROUTES ====================
 
 // Status endpoint
 router.get('/status', (req, res) => {

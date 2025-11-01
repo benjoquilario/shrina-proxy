@@ -9,6 +9,41 @@ const gunzipAsync = promisify(gunzip);
 const brotliDecompressAsync = promisify(brotliDecompress);
 const inflateAsync = promisify(inflate);
 
+/**
+ * Detect obfuscated video segments (fake extensions to bypass blockers)
+ * These files claim to be .js, .css, .txt, .png but are actually video segments
+ * They also falsely claim br/gzip encoding when they're not compressed
+ */
+export function isObfuscatedVideoSegment(url: string, contentType?: string | null): boolean {
+  const urlLower = url.toLowerCase();
+  
+  // Pattern: seg-XXX-f1-v1-a1.[js|css|txt|png|jpg|jpeg|gif|svg|woff|ttf|ico]
+  const obfuscatedPattern = /seg-\d+-f\d+-v\d+-a\d+\.(js|css|txt|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico|json|xml|html|htm)$/i;
+  
+  // Check URL pattern
+  if (obfuscatedPattern.test(urlLower)) {
+    return true;
+  }
+  
+  // Some CDNs also use patterns like: chunk-XXX.js, segment_XXX.png, etc.
+  const alternativePatterns = [
+    /chunk-\d+\.(js|css|png|jpg)$/i,
+    /segment[_-]\d+\.(js|css|txt)$/i,
+    /frag[_-]\d+\.(png|jpg|css)$/i,
+  ];
+  
+  for (const pattern of alternativePatterns) {
+    if (pattern.test(urlLower)) {
+      // Additional check: if content-type doesn't match extension, it's likely obfuscated
+      if (contentType && !contentType.includes('video') && !contentType.includes('octet-stream')) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
 // ==================== COMPRESSION HANDLER ====================
 
 /**
@@ -400,6 +435,84 @@ function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ==================== IMAGE PROXY HELPERS ====================
+
+/**
+ * Encode an image URL to base64 for use in image proxy
+ * @param imageUrl The original image URL
+ * @returns Base64 encoded URL (URL-safe)
+ */
+export function encodeImageUrl(imageUrl: string): string {
+  try {
+    // Convert to base64
+    const base64 = Buffer.from(imageUrl, 'utf-8').toString('base64');
+    
+    // Make it URL-safe by replacing characters
+    return base64
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+  } catch (error) {
+    logger.error('Error encoding image URL:', error);
+    throw new Error('Failed to encode image URL');
+  }
+}
+
+/**
+ * Decode a base64 encoded image URL
+ * @param encodedUrl The base64 encoded URL (URL-safe)
+ * @returns Decoded original URL
+ */
+export function decodeImageUrl(encodedUrl: string): string {
+  try {
+    // Restore standard base64 characters
+    let base64 = encodedUrl
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+    
+    // Add padding if needed
+    while (base64.length % 4 !== 0) {
+      base64 += '=';
+    }
+    
+    // Decode from base64
+    return Buffer.from(base64, 'base64').toString('utf-8');
+  } catch (error) {
+    logger.error('Error decoding image URL:', error);
+    throw new Error('Failed to decode image URL');
+  }
+}
+
+/**
+ * Generate a proxied image URL
+ * @param imageUrl The original image URL
+ * @param proxyBaseUrl The base URL of the image proxy (e.g., '/image')
+ * @returns Proxied image URL
+ */
+export function generateProxiedImageUrl(imageUrl: string, proxyBaseUrl: string = '/image'): string {
+  const encodedUrl = encodeImageUrl(imageUrl);
+  return `${proxyBaseUrl}/${encodedUrl}`;
+}
+
+/**
+ * Check if a URL points to an image based on extension or content type
+ * @param url The URL to check
+ * @param contentType Optional content type header
+ * @returns True if the URL is likely an image
+ */
+export function isImageUrl(url: string, contentType?: string | null): boolean {
+  // Check content type first if available
+  if (contentType) {
+    return contentType.startsWith('image/');
+  }
+  
+  // Check file extension
+  const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico', '.tiff', '.tif', '.avif'];
+  const urlLower = url.toLowerCase();
+  
+  return imageExtensions.some(ext => urlLower.includes(ext));
+}
+
 // Export all helper functions
 export default {
   decompressContent,
@@ -408,4 +521,8 @@ export default {
   detectTransportStream,
   processVttContent,
   escapeRegExp,
+  encodeImageUrl,
+  decodeImageUrl,
+  generateProxiedImageUrl,
+  isImageUrl,
 };

@@ -48,6 +48,8 @@ export const ROUTES = {
   PROXY_BASE: '/proxy',
   PROXY_PATH: '/proxy/:url',
   PROXY_BASE64: '/proxy-base64/:encodedUrl',
+  IMAGE_PROXY_BASE: '/image',
+  IMAGE_PROXY_PATH: '/image/:encodedUrl',
 };
 
 /**

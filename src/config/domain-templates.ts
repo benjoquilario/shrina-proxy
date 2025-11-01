@@ -227,15 +227,18 @@ export const domainTemplates: DomainTemplate[] = [
       'sec-fetch-site': 'cross-site',
       'cache-control': 'no-cache',
       'pragma': 'no-cache',
-      'sec-gpc': '1',
-      'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Brave";v="140"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
     },
     headersFn: (url: URL) => {
+      // For .key files, use the full directory path as referer
+      // This helps with encryption key access that requires exact referer
+      const isKeyFile = url.pathname.endsWith('.key');
+      const referer = isKeyFile
+        ? url.origin + url.pathname.substring(0, url.pathname.lastIndexOf('/') + 1)
+        : url.origin + '/';
+      
       return {
-        'origin': 'https://kwik.si',
-        'referer': 'https://kwik.si/',
+        'origin': url.origin,
+        'referer': referer,
       };
     }
   },
@@ -522,6 +525,27 @@ export const domainTemplates: DomainTemplate[] = [
         return {
           'origin': 'https://kerolaunochan.online',
           'referer': 'https://kerolaunochan.online/',
+        };
+      }
+    },
+
+    // clearskyline88.online - MegaCloud CDN
+    {
+      pattern: /clearskyline88\.online$/i,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.5',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+        'cache-control': 'no-cache',
+        'pragma': 'no-cache',
+      },
+      headersFn: (url: URL) => {
+        return {
+          'origin': 'https://megacloud.blog',
+          'referer': 'https://megacloud.blog/',
         };
       }
     },
@@ -954,11 +978,12 @@ export const domainTemplates: DomainTemplate[] = [
         'accept-language': 'en-US,en;q=0.5',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
+        'accept-encoding': 'identity;q=1, *;q=0',
         'sec-fetch-site': 'cross-site',
-        'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Brave";v="140"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
         'priority': 'u=1, i',
+        'range': 'bytes=0-'
       },
       headersFn: (url: URL) => {
         return {
