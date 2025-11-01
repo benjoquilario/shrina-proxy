@@ -1597,10 +1597,10 @@ router.post('/metrics/reset', (req, res) => {
 // Main proxy route with URL as query parameter
 router.all('/', validateUrlParam, proxyRequest);
 
-// Proxy route with URL as path parameter
-router.all('/:url(*)', validateUrlParam, proxyRequest);
-
-// Proxy route with base64 encoded URL
+// Proxy route with base64 encoded URL - MUST come before catch-all route
 router.all('/base64/:encodedUrl', validateUrlParam, proxyRequest);
+
+// Proxy route with URL as path parameter - catch-all route (must be last)
+router.all('/:url(*)', validateUrlParam, proxyRequest);
 
 export default router;
